@@ -483,13 +483,20 @@ def import_project(
                     (trusted_path, project_name, project_id),
                 )
     else:
+        # A path already owned by another project (possible when the lossy
+        # fallback collapses two hyphenated dirs onto one path) must not be
+        # re-keyed onto this one. Fall back to the encoded directory key,
+        # which is unique by construction. Import lookups go through `key`;
+        # the CWD-based recall scope filter matches on `path`, so this
+        # project stays out of scope until a trusted cwd repairs the path.
+        cursor.execute("SELECT 1 FROM projects WHERE path = ?", (project_path,))
+        if cursor.fetchone() is not None:
+            project_path = project_key
         cursor.execute(
-            "INSERT INTO projects (path, key, name) VALUES (?, ?, ?)"
-            " ON CONFLICT(path) DO UPDATE SET key = excluded.key, name = excluded.name",
+            "INSERT INTO projects (path, key, name) VALUES (?, ?, ?)",
             (project_path, project_key, project_name),
         )
-        cursor.execute("SELECT id FROM projects WHERE key = ?", (project_key,))
-        project_id = cursor.fetchone()[0]
+        project_id = cursor.lastrowid
 
     sessions_imported = 0
     messages_imported = 0
