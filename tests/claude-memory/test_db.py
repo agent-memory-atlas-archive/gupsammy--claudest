@@ -14,6 +14,8 @@ from memory_lib.db import (
     SCHEMA,
     _migrate_columns,
     _migrate_project_paths,
+    get_db_connection,
+    resolve_project_cwd,
     load_config,
     load_settings,
     migrate_db,
@@ -210,7 +212,7 @@ class TestVersionedMigration:
         conn = _pre_migration_db()
         _migrate_columns(conn)
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 4
+        assert version == 5
         conn.close()
 
     def test_v0_to_v2_backfills_both(self):
@@ -229,7 +231,7 @@ class TestVersionedMigration:
         assert rows[0] == (1, 0)
         assert rows[1] == (2, 1)
         assert rows[2] == (3, 1)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         conn.close()
 
     def test_v1_to_v2_backfills_only_teammate(self):
@@ -249,7 +251,7 @@ class TestVersionedMigration:
         assert rows[0] == (1, 1)  # Already flagged, untouched
         assert rows[1] == (2, 1)  # Newly flagged by version 2
         assert rows[2] == (3, 0)  # Normal, untouched
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         conn.close()
 
     def test_v2_skips_data_backfills(self):
@@ -265,7 +267,7 @@ class TestVersionedMigration:
         cursor.execute("SELECT is_notification FROM messages WHERE id = 1")
         assert cursor.fetchone()[0] == 0
         # v3 migration runs from v2, bumping version to 3
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         conn.close()
 
     def test_v2_to_v3_preserves_import_log(self):
@@ -281,7 +283,7 @@ class TestVersionedMigration:
         assert count == 1
         hash_val = conn.execute("SELECT file_hash FROM import_log").fetchone()[0]
         assert hash_val == "abc123"
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         conn.close()
 
     def test_v3_backfill_updates_origin(self, tmp_path):
@@ -648,7 +650,7 @@ class TestV4Migration:
         """After migration from v3, user_version should be 4."""
         conn = _v3_db_with_messages()
         _migrate_columns(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] >= 4
         conn.close()
 
     def test_v4_clears_task_notification_origin(self):
@@ -678,7 +680,7 @@ class TestV4Migration:
         _migrate_columns(conn)  # v3->v4
         _migrate_columns(conn)  # no-op
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] >= 4
         origin = conn.execute("SELECT origin FROM messages WHERE id = 1").fetchone()[0]
         assert origin == "telegram", "idempotent re-run must not corrupt already-correct data"
         conn.close()
@@ -831,3 +833,171 @@ class TestMigrateDbBackupGuard:
         assert count == 1, (
             "Original session data must be intact after aborted migration"
         )
+
+
+def _add_project(cursor, path, key, name):
+    cursor.execute("INSERT INTO projects (path, key, name) VALUES (?, ?, ?)", (path, key, name))
+    return cursor.lastrowid
+
+
+def _add_sessions(cursor, project_id, cwd, count=1):
+    for _ in range(count):
+        cursor.execute(
+            "INSERT INTO sessions (uuid, project_id, cwd) VALUES (lower(hex(randomblob(16))), ?, ?)",
+            (project_id, cwd),
+        )
+
+
+def _sessions_in(cursor, project_id):
+    return cursor.execute("SELECT COUNT(*) FROM sessions WHERE project_id = ?", (project_id,)).fetchone()[0]
+
+
+class TestResolveProjectCwd:
+    def test_claude_worktree_resolves_to_main_checkout(self):
+        conn = _project_path_db()
+        assert resolve_project_cwd(conn, "/r/proj/.claude/worktrees/fix") == "/r/proj"
+
+    def test_codex_worktree_resolves_to_unique_same_named_project(self):
+        conn = _project_path_db()
+        _add_project(conn.cursor(), "/r/tiny", "-r-tiny", "tiny")
+        assert resolve_project_cwd(conn, "/u/.codex/worktrees/aa5e/tiny") == "/r/tiny"
+
+    def test_codex_worktree_kept_when_name_is_ambiguous(self):
+        conn = _project_path_db()
+        cursor = conn.cursor()
+        _add_project(cursor, "/r/tiny", "-r-tiny", "tiny")
+        _add_project(cursor, "/other/tiny", "-other-tiny", "tiny")
+        wt = "/u/.codex/worktrees/aa5e/tiny"
+        assert resolve_project_cwd(conn, wt) == wt
+
+    def test_codex_worktree_ignores_other_worktree_projects_as_candidates(self):
+        conn = _project_path_db()
+        _add_project(conn.cursor(), "/u/.codex/worktrees/bbbb/tiny", "-u--codex-worktrees-bbbb-tiny", "tiny")
+        wt = "/u/.codex/worktrees/aa5e/tiny"
+        assert resolve_project_cwd(conn, wt) == wt
+
+
+class TestWorktreeProjectFolding:
+    def test_legacy_claude_worktree_project_merges_into_main(self):
+        """Sessions imported before worktree normalization move to the main project."""
+        conn = _project_path_db()
+        cursor = conn.cursor()
+        main_id = _add_project(cursor, "/r/proj", "-r-proj", "proj")
+        _add_sessions(cursor, main_id, "/r/proj")
+        wt_id = _add_project(cursor, "/r/proj/.claude/worktrees/pr", "-r-proj--claude-worktrees-pr", "pr")
+        _add_sessions(cursor, wt_id, "/r/proj/.claude/worktrees/pr", count=3)
+        conn.commit()
+
+        _migrate_project_paths(conn)
+
+        assert _sessions_in(cursor, main_id) == 4
+        assert cursor.execute("SELECT 1 FROM projects WHERE id = ?", (wt_id,)).fetchone() is None
+
+    def test_claude_worktree_project_without_main_takes_main_path_and_key(self):
+        """The surviving row must carry the main key, or the next import of the
+        main checkout would miss it and create a duplicate project."""
+        conn = _project_path_db()
+        cursor = conn.cursor()
+        wt_id = _add_project(cursor, "/r/proj/.claude/worktrees/pr", "-r-proj--claude-worktrees-pr", "pr")
+        _add_sessions(cursor, wt_id, "/r/proj/.claude/worktrees/pr")
+        conn.commit()
+
+        _migrate_project_paths(conn)
+
+        row = cursor.execute("SELECT path, key, name FROM projects WHERE id = ?", (wt_id,)).fetchone()
+        assert row == ("/r/proj", "-r-proj", "proj")
+
+    def test_codex_worktree_project_merges_into_same_named_main(self):
+        conn = _project_path_db()
+        cursor = conn.cursor()
+        main_id = _add_project(cursor, "/r/tiny", "-r-tiny", "tiny")
+        _add_sessions(cursor, main_id, "/r/tiny")
+        wt_id = _add_project(cursor, "/u/.codex/worktrees/aa5e/tiny", "-u--codex-worktrees-aa5e-tiny", "tiny")
+        _add_sessions(cursor, wt_id, "/u/.codex/worktrees/aa5e/tiny", count=2)
+        conn.commit()
+
+        _migrate_project_paths(conn)
+
+        assert _sessions_in(cursor, main_id) == 3
+        assert cursor.execute("SELECT 1 FROM projects WHERE id = ?", (wt_id,)).fetchone() is None
+
+    def test_main_project_keeps_its_path_when_worktree_sessions_outnumber_it(self):
+        """Worktree sessions vote for the main checkout, so they never rename it."""
+        conn = _project_path_db()
+        cursor = conn.cursor()
+        main_id = _add_project(cursor, "/r/proj", "-r-proj", "proj")
+        _add_sessions(cursor, main_id, "/r/proj")
+        _add_sessions(cursor, main_id, "/r/proj/.claude/worktrees/a", count=3)
+        conn.commit()
+
+        _migrate_project_paths(conn)
+
+        assert cursor.execute("SELECT path FROM projects WHERE id = ?", (main_id,)).fetchone()[0] == "/r/proj"
+
+
+def _worktree_db_at_v4(db_file):
+    """File-backed DB at v4 holding a main project and a legacy worktree project."""
+    conn = get_db_connection({"db_path": str(db_file)})
+    cursor = conn.cursor()
+    main_id = _add_project(cursor, "/r/proj", "-r-proj", "proj")
+    _add_sessions(cursor, main_id, "/r/proj")
+    wt_id = _add_project(cursor, "/r/proj/.claude/worktrees/pr", "-r-proj--claude-worktrees-pr", "pr")
+    _add_sessions(cursor, wt_id, "/r/proj/.claude/worktrees/pr", count=2)
+    conn.execute("PRAGMA user_version = 4")
+    conn.commit()
+    conn.close()
+    return main_id, wt_id
+
+
+class TestV5WorktreeFoldBackup:
+    def test_backup_taken_before_first_fold(self, tmp_path):
+        db_file = tmp_path / "conversations.db"
+        main_id, wt_id = _worktree_db_at_v4(db_file)
+
+        conn = get_db_connection({"db_path": str(db_file)})
+
+        assert list(tmp_path.glob("conversations.pre-v5-worktree-fold-*.db")), "no pre-fold backup on disk"
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert _sessions_in(conn.cursor(), main_id) == 3
+        assert conn.execute("SELECT 1 FROM projects WHERE id = ?", (wt_id,)).fetchone() is None
+        conn.close()
+
+    def test_fold_waits_when_backup_fails(self, tmp_path, monkeypatch):
+        import memory_lib.db as db_module
+        monkeypatch.setattr(db_module, "_backup_db_before_migration", lambda *_: False)
+        db_file = tmp_path / "conversations.db"
+        main_id, wt_id = _worktree_db_at_v4(db_file)
+
+        conn = get_db_connection({"db_path": str(db_file)})
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert _sessions_in(conn.cursor(), main_id) == 1, "sessions moved without a backup"
+        assert conn.execute("SELECT 1 FROM projects WHERE id = ?", (wt_id,)).fetchone() is not None
+        conn.close()
+
+    def test_failed_fold_leaves_no_partial_changes_pending(self, tmp_path, monkeypatch):
+        """A fold that fails partway must roll back, or the caller's next commit
+        would persist a half-applied merge."""
+        import memory_lib.db as db_module
+        db_file = tmp_path / "conversations.db"
+        conn = get_db_connection({"db_path": str(db_file)})
+        cursor = conn.cursor()
+        main_id = _add_project(cursor, "/r/a", "-r-a", "a")
+        _add_sessions(cursor, main_id, "/r/a")
+        wt_a = _add_project(cursor, "/r/a/.claude/worktrees/x", "-r-a--claude-worktrees-x", "x")
+        _add_sessions(cursor, wt_a, "/r/a/.claude/worktrees/x")
+        wt_b = _add_project(cursor, "/r/b/.claude/worktrees/y", "-r-b--claude-worktrees-y", "y")
+        _add_sessions(cursor, wt_b, "/r/b/.claude/worktrees/y")
+        conn.commit()
+        conn.close()
+
+        def boom(*_):
+            raise RuntimeError("fail after the first merge")
+        monkeypatch.setattr(db_module, "_rekeyed_worktree_key", boom)
+
+        conn = get_db_connection({"db_path": str(db_file)})
+        conn.commit()  # what a hook does next
+
+        assert _sessions_in(conn.cursor(), main_id) == 1, "half-applied fold was committed"
+        assert conn.execute("SELECT 1 FROM projects WHERE id = ?", (wt_a,)).fetchone() is not None
+        conn.close()

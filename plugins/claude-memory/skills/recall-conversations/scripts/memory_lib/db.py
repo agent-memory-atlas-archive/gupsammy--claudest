@@ -13,6 +13,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+from memory_lib.formatting import codex_worktree_repo, get_project_key, normalize_cwd, normalize_project_key
+
 # Default paths
 DEFAULT_DB_PATH = Path.home() / ".claude-memory" / "conversations.db"
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -482,6 +484,14 @@ CREATE INDEX IF NOT EXISTS idx_token_snapshots_start ON token_snapshots(start_ti
         conn.execute("PRAGMA user_version = 4")
         conn.commit()
 
+    if version < 5:
+        # Worktree folding: _migrate_project_paths folds worktree projects into their
+        # main checkout, moving sessions between projects. Snapshot first; the
+        # fold is gated on v5, so it never runs without a backup on disk.
+        if not db_path.name or _backup_db_before_migration(db_path, "v5-worktree-fold"):
+            conn.execute("PRAGMA user_version = 5")
+            conn.commit()
+
 
 def _backup_db_before_migration(db_path: Path, label: str) -> bool:
     """Create a timestamped WAL-safe backup using sqlite3.Connection.backup().
@@ -581,6 +591,35 @@ def _backfill_origin(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> None:
     conn.commit()
 
 
+def resolve_project_cwd(conn: sqlite3.Connection, cwd: str) -> str:
+    """Map a session cwd to its project root, folding worktrees into the main checkout.
+
+    Claude worktrees (<repo>/.claude/worktrees/<name>) resolve by path. Codex
+    worktrees (~/.codex/worktrees/<id>/<repo>) only carry the repo's directory
+    name, so they resolve to the one non-worktree project with that name; with
+    zero or several candidates the worktree path is kept as its own project.
+    """
+    path = normalize_cwd(cwd)
+    repo = codex_worktree_repo(path)
+    if repo is None:
+        return path
+    rows = conn.execute("SELECT path FROM projects WHERE name = ?", (repo,)).fetchall()
+    mains = [p for (p,) in rows if p and codex_worktree_repo(p) is None and normalize_cwd(p) == p]
+    return mains[0] if len(mains) == 1 else path
+
+
+def _rekeyed_worktree_key(conn: sqlite3.Connection, proj_id: int, key: str, real_cwd: str) -> str:
+    """Return the main-checkout key for a worktree project row, or its current key."""
+    if normalize_project_key(key) != key:
+        new_key = normalize_project_key(key)  # keeps Claude Code's own directory encoding
+    elif "--codex-worktrees-" in key:  # get_project_key encoding of /.codex/worktrees/
+        new_key = get_project_key(real_cwd)
+    else:
+        return key
+    taken = conn.execute("SELECT 1 FROM projects WHERE key = ? AND id != ?", (new_key, proj_id)).fetchone()
+    return key if taken else new_key
+
+
 def _migrate_project_paths(conn: sqlite3.Connection) -> None:
     """Fix project paths that were incorrectly derived from hyphenated directory keys.
 
@@ -594,6 +633,9 @@ def _migrate_project_paths(conn: sqlite3.Connection) -> None:
     project path and name. It also merges duplicate projects that resolve to the same
     real path.
 
+    Session cwds are resolved through resolve_project_cwd first, so worktree
+    projects (Claude or Codex) merge into their main checkout's project.
+
     This is idempotent: after fixing, the project path matches session cwd, so subsequent
     runs find no mismatch and do nothing.
     """
@@ -601,9 +643,7 @@ def _migrate_project_paths(conn: sqlite3.Connection) -> None:
 
     # Find all projects that have at least one session with a non-null cwd
     cursor.execute("""
-        SELECT p.id, p.path, p.name,
-               s.cwd,
-               COUNT(*) AS cwd_count
+        SELECT p.id, s.cwd, COUNT(*) AS cwd_count
         FROM projects p
         JOIN sessions s ON s.project_id = p.id
         WHERE s.cwd IS NOT NULL AND s.cwd != ''
@@ -614,17 +654,21 @@ def _migrate_project_paths(conn: sqlite3.Connection) -> None:
     if not rows:
         return
 
-    # For each project, pick the most common cwd as the authoritative real path
-    best_cwd: dict[int, str] = {}
-    for proj_id, _path, _name, cwd, _count in rows:
-        if proj_id not in best_cwd:
-            best_cwd[proj_id] = cwd  # rows ordered by cwd_count DESC, first wins
+    # For each project, pick the most common resolved root as the authoritative
+    # path. Resolve everything before mutating: Codex resolution reads projects.
+    tallies: dict[int, dict[str, int]] = {}
+    for proj_id, cwd, count in rows:
+        per_root = tallies.setdefault(proj_id, {})
+        root = resolve_project_cwd(conn, cwd)
+        per_root[root] = per_root.get(root, 0) + count
+    # sorted() makes ties pick the same root every run, whatever the row order.
+    best_cwd = {proj_id: max(sorted(per_root), key=per_root.get) for proj_id, per_root in tallies.items()}
 
     # Now check which projects need updating
-    cursor.execute("SELECT id, path, name FROM projects")
+    cursor.execute("SELECT id, path, key FROM projects")
     projects = cursor.fetchall()
 
-    for proj_id, stored_path, _stored_name in projects:
+    for proj_id, stored_path, stored_key in projects:
         real_cwd = best_cwd.get(proj_id)
         if not real_cwd or real_cwd == stored_path:
             continue  # No cwd data or already correct
@@ -644,10 +688,11 @@ def _migrate_project_paths(conn: sqlite3.Connection) -> None:
             )
             cursor.execute("DELETE FROM projects WHERE id = ?", (proj_id,))
         else:
-            # Simple fix: update path and name
+            # Simple fix: update path and name; a worktree row also takes the
+            # main checkout's key so later imports of that checkout find it.
             cursor.execute(
-                "UPDATE projects SET path = ?, name = ? WHERE id = ?",
-                (real_cwd, real_name, proj_id)
+                "UPDATE projects SET path = ?, name = ?, key = ? WHERE id = ?",
+                (real_cwd, real_name, _rekeyed_worktree_key(conn, proj_id, stored_key, real_cwd), proj_id)
             )
 
     conn.commit()
@@ -692,11 +737,16 @@ def get_db_connection(settings: Optional[dict] = None) -> sqlite3.Connection:
     # Add any missing columns (e.g. tool_summary)
     _migrate_columns(conn)
 
-    # Fix project paths that were incorrectly derived from hyphenated directory keys
+    # Fix project paths and fold worktree projects into their main checkout.
+    # Waits for v5, whose migration takes the pre-fold backup.
     try:
-        _migrate_project_paths(conn)
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 5:
+            _migrate_project_paths(conn)
     except Exception:
-        pass  # Never block DB connection on data migration errors
+        # Never block DB connection on data migration errors. Roll back so the
+        # caller's next commit can't persist a half-applied fold; it retries on
+        # the next connection.
+        conn.rollback()
 
     return conn
 
