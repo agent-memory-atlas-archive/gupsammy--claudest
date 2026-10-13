@@ -28,13 +28,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "skills" / "recall-conversations" / "scripts"))
 
 from memory_lib.db import get_db_path, load_config, load_settings, setup_logging, get_db_connection
+from memory_lib.embeddings import related_sessions
 from memory_lib.formatting import format_time, format_time_full, get_project_key, normalize_cwd
-from memory_lib.summarizer import build_exchange_pairs, truncate_mid
+from memory_lib.summarizer import build_exchange_pairs, render_context_summary, truncate_mid
+
+# The harness inlines SessionStart context up to 10,000 chars and spills anything
+# longer to a file with a ~2KB preview; stay under it with margin.
+CONTEXT_MAX_CHARS = 9500
+_SESSION_SEP = "\n\n---\n\n"
 
 
 def _row_to_entry(row) -> dict:
     """Convert a candidate row to an entry dict."""
-    _session_id, uuid, started_at, ended_at, exchange_count, files_json, commits_json, git_branch, branch_db_id, context_summary = row
+    _session_id, uuid, started_at, ended_at, exchange_count, files_json, commits_json, git_branch, branch_db_id, context_summary, context_summary_json = row
     return {
         "uuid": uuid,
         "started_at": started_at,
@@ -45,13 +51,14 @@ def _row_to_entry(row) -> dict:
         "git_branch": git_branch,
         "branch_db_id": branch_db_id,
         "context_summary": context_summary,
+        "context_summary_json": context_summary_json,
     }
 
 
 _CANDIDATE_QUERY = """
     SELECT s.id, s.uuid, b.started_at, b.ended_at, b.exchange_count,
            b.files_modified, b.commits, s.git_branch, b.id as branch_db_id,
-           b.context_summary
+           b.context_summary, b.context_summary_json
     FROM sessions s
     JOIN branches b ON b.session_id = s.id AND b.is_active = 1
     WHERE s.project_id = ?
@@ -64,7 +71,7 @@ _CANDIDATE_QUERY = """
 _SESSION_BY_UUID_QUERY = """
     SELECT s.id, s.uuid, b.started_at, b.ended_at, b.exchange_count,
            b.files_modified, b.commits, s.git_branch, b.id as branch_db_id,
-           b.context_summary
+           b.context_summary, b.context_summary_json
     FROM sessions s
     JOIN branches b ON b.session_id = s.id AND b.is_active = 1
     WHERE s.project_id = ?
@@ -432,24 +439,76 @@ def build_origin_block(source: str, sessions: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_context(sessions: list[dict]) -> str:
-    """Build markdown context from selected sessions.
+def build_related_block(conn: sqlite3.Connection, settings: dict, sessions: list[dict]) -> str:
+    """List past sessions closest in meaning to the primary one, from any project.
 
-    Uses cached context_summary when available, falls back to
-    truncated last-3 exchanges for uncached branches.
+    Empty when semantic search is off or the primary session has no vector yet.
+    """
+    if not settings.get("semantic_search") or not sessions:
+        return ""
+    uuids = [s["uuid"] for s in sessions]
+    placeholders = ",".join("?" * len(uuids))
+    ids = dict(conn.execute(f"SELECT uuid, id FROM sessions WHERE uuid IN ({placeholders})", uuids))
+    primary = ids.get(sessions[0]["uuid"])
+    if primary is None:
+        return ""
+    hits = related_sessions(conn, settings["embedding_model"], primary, exclude=tuple(ids.values()))
+    if not hits:
+        return ""
+    lines = [
+        "## Related Sessions",
+        "Past sessions closest in meaning to the latest one above. Fetch one with the "
+        "recall skill's `recent_chats.py --session <id>` when the work touches it.",
+    ]
+    for session_id, score in hits:
+        row = conn.execute("""
+            SELECT s.uuid, p.name, b.started_at, b.context_summary
+            FROM sessions s JOIN projects p ON p.id = s.project_id
+            JOIN branches b ON b.session_id = s.id AND b.is_active = 1
+            WHERE s.id = ? ORDER BY b.ended_at DESC LIMIT 1
+        """, (session_id,)).fetchone()
+        if not row:
+            continue
+        uuid, project, started_at, summary = row
+        topic = _extract_topic({"context_summary": summary or ""})[:100] or "(no topic)"
+        lines.append(f"- {format_time(started_at, '%Y-%m-%d')} · {project} · {topic} [{uuid[:8]}]")
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+def _render_session(session: dict, max_chars: int) -> str:
+    """Render one session within max_chars: re-render the stored JSON summary to the
+    budget, else cut the cached markdown, else build from raw messages."""
+    raw = session.get("context_summary_json")
+    if raw:
+        try:
+            text = render_context_summary(json.loads(raw), max_chars)
+        except (ValueError, TypeError):
+            text = ""
+        if text:
+            return text
+    cached = session.get("context_summary")
+    if cached:
+        return cached[:max_chars]
+    return _build_fallback_context(session)[:max_chars]
+
+
+def build_context(sessions: list[dict], max_chars: int = CONTEXT_MAX_CHARS) -> str:
+    """Build markdown context from selected sessions, no longer than max_chars.
+
+    Each session gets an equal share of what earlier sessions left unused, so the
+    short sessions listed first hand their slack to the substantive one at the end.
     """
     if not sessions:
         return ""
 
+    remaining = max_chars - len(_SESSION_SEP) * (len(sessions) - 1)
     parts = []
-    for session in sessions:
-        cached = session.get("context_summary")
-        if cached:
-            parts.append(cached)
-        else:
-            parts.append(_build_fallback_context(session))
+    for i, session in enumerate(sessions):
+        part = _render_session(session, max(remaining // (len(sessions) - i), 0))
+        parts.append(part)
+        remaining -= len(part)
 
-    return "\n\n---\n\n".join(parts)
+    return _SESSION_SEP.join(parts)
 
 
 def main():
@@ -495,42 +554,43 @@ def main():
         return
 
     try:
-        conn = get_db_connection(settings)
+        # Foreground: never wait on a data migration; background workers run it.
+        conn = get_db_connection(settings, migrate=False)
         project_key = get_project_key(cwd)
         max_sessions = settings.get("max_context_sessions", 2)
         sessions = select_sessions(conn, project_key, session_id, max_sessions, source=source, db_path=db_path, cwd=cwd)
+        try:
+            related = build_related_block(conn, settings, sessions)
+        except Exception as e:
+            logger.error(f"Related sessions error: {e}")
+            related = ""
         conn.close()
 
         if not sessions:
             print(json.dumps({}))
             return
 
-        context = build_context(sessions)
+        # Top-of-context directive: placed first because earlier tokens receive
+        # more attention. Tells Claude how to read the rest of this injection.
+        directive = (
+            "## How To Use This Context\n"
+            "- Sessions below are ordered most-recent first. Each session opens with "
+            "where it left off (its last exchanges, oldest to newest), then how it began.\n"
+            "- For anything beyond the sessions shown here, invoke the "
+            "`claude-memory:recall-conversations` skill via the Skill tool rather than guessing."
+        )
+        origin = build_origin_block(source, sessions)
+
+        # Directive + origin + sessions + related stay within CONTEXT_MAX_CHARS so the
+        # harness inlines all of it instead of spilling to a file.
+        tail = f"\n\n{related}" if related else ""
+        context = build_context(sessions, CONTEXT_MAX_CHARS - len(directive) - len(origin) - len(tail) - 4)
         if not context:
             print(json.dumps({}))
             return
 
         logger.info(f"Injecting context from {len(sessions)} session(s) for project {project_key}")
-
-        # Top-of-context directive: placed first because the hook's inline
-        # preview may be truncated by the harness, and because earlier tokens
-        # receive more attention. Tells Claude how to read the rest of this
-        # injection and when to reach for the persisted file or recall skill.
-        directive = (
-            "## How To Use This Context\n"
-            "- Sessions below are ordered most-recent first, and within each session "
-            "the most recent exchanges come first. Read top-down to get the freshest "
-            "context before older context.\n"
-            "- If this hook's output was truncated inline and a persisted file path "
-            "is referenced, Read that file before answering any message that references "
-            "prior work — the last exchanges of the previous session may live only there.\n"
-            "- For anything beyond the sessions shown here, invoke the "
-            "`claude-memory:recall-conversations` skill via the Skill tool rather than guessing."
-        )
-
-        # Wrap in directive + origin block + session content
-        origin = build_origin_block(source, sessions)
-        full_context = f"{directive}\n\n{origin}\n\n{context}"
+        full_context = f"{directive}\n\n{origin}\n\n{context}{tail}"
 
         output = {
             "hookSpecificOutput": {
