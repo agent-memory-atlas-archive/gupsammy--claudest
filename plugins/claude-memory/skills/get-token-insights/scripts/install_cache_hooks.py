@@ -2,11 +2,11 @@
 """
 Cache-bust hook installer for get-token-insights.
 
-Copies 3 validated hook scripts into ~/.claude/hooks/ and merges the
-corresponding hook matcher blocks into ~/.claude/settings.json.
+Copies 2 validated hook scripts into ~/.claude/hooks/ and merges the
+corresponding hook matcher blocks into ~/.claude/settings.json. Retired hooks
+from earlier versions (RETIRED_HOOKS) are removed from both.
 
 Hooks installed:
-  SessionStart  → cache-resume-detect.py  (flags resumed sessions for warn)
   Stop          → cache-warn-stop.py      (stamps last-idle timestamp)
   UserPromptSubmit → cache-expiry-warn.py (blocks prompt when cache expired)
 
@@ -32,7 +32,6 @@ HOOKS_DIR = Path.home() / ".claude" / "hooks"
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 HOOK_FILES = [
-    "cache-resume-detect.py",
     "cache-warn-stop.py",
     "cache-expiry-warn.py",
 ]
@@ -41,13 +40,6 @@ HOOK_FILES = [
 # idempotency check. The installer skips injection if any existing block's
 # command already contains the substring.
 HOOK_BLOCKS = {
-    "SessionStart": {
-        "check_substr": "cache-resume-detect.py",
-        "block": {
-            "matcher": "*",
-            "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/cache-resume-detect.py"}],
-        },
-    },
     "Stop": {
         "check_substr": "cache-warn-stop.py",
         "block": {
@@ -65,13 +57,45 @@ HOOK_BLOCKS = {
 }
 
 
-def _already_in_hooks(event_list: list[dict], substr: str) -> bool:
+# Shipped by earlier versions; cache-expiry-warn.py now covers resumed sessions
+# by reading the transcript when no Stop state exists.
+RETIRED_HOOKS = ["cache-resume-detect.py"]
+
+
+def _hook_mentions(hook: object, substr: str) -> bool:
+    """True if a hook entry's command contains substr.
+
+    settings.json is user-edited, so tolerate non-dict entries and null commands.
+    """
+    return isinstance(hook, dict) and substr in str(hook.get("command") or "")
+
+
+def _block_mentions(block: object, substr: str) -> bool:
+    """True if a matcher block has a hook command containing substr."""
+    return isinstance(block, dict) and any(
+        _hook_mentions(h, substr) for h in block.get("hooks") or []
+    )
+
+
+def _without_hook(event_list: list, substr: str) -> list:
+    """event_list minus hook entries mentioning substr; blocks left empty are dropped.
+
+    Filters per hook, not per block, so a user's own hook sharing a block survives.
+    """
+    kept = []
+    for b in event_list:
+        if not _block_mentions(b, substr):
+            kept.append(b)
+            continue
+        hooks = [h for h in b["hooks"] if not _hook_mentions(h, substr)]
+        if hooks:
+            kept.append({**b, "hooks": hooks})
+    return kept
+
+
+def _already_in_hooks(event_list: list, substr: str) -> bool:
     """Return True if any existing hook command contains substr."""
-    for matcher_block in event_list:
-        for hook in matcher_block.get("hooks", []):
-            if substr in hook.get("command", ""):
-                return True
-    return False
+    return any(_block_mentions(b, substr) for b in event_list)
 
 
 def check_status() -> dict[str, dict]:
@@ -85,10 +109,18 @@ def check_status() -> dict[str, dict]:
             cfg = json.loads(SETTINGS_PATH.read_text())
         except json.JSONDecodeError:
             cfg = {}
-        hooks_cfg = cfg.get("hooks", {})
+        hooks_cfg = cfg.get("hooks") if isinstance(cfg, dict) else None
+        if not isinstance(hooks_cfg, dict):
+            hooks_cfg = {}
+        lists = {k: v for k, v in hooks_cfg.items() if isinstance(v, list)}
         for event, spec in HOOK_BLOCKS.items():
-            wired = _already_in_hooks(hooks_cfg.get(event, []), spec["check_substr"])
+            wired = _already_in_hooks(lists.get(event, []), spec["check_substr"])
             result[f"settings:{event}"] = {"wired": wired}
+        for fname in RETIRED_HOOKS:
+            wired = any(_already_in_hooks(v, fname) for v in lists.values())
+            result[f"settings:retired:{fname}"] = {"wired": wired}
+    for fname in RETIRED_HOOKS:
+        result[f"retired:{fname}"] = {"file_exists": (HOOKS_DIR / fname).exists()}
     return result
 
 
@@ -133,11 +165,38 @@ def install(dry_run: bool = False) -> bool:
     except json.JSONDecodeError as exc:
         raise InstallError(f"settings.json is malformed: {exc}") from exc
 
+    if not isinstance(cfg, dict):
+        raise InstallError("settings.json top level is not an object")
     hooks_cfg = cfg.setdefault("hooks", {})
+    if not isinstance(hooks_cfg, dict):
+        raise InstallError("settings.json hooks is not an object")
     settings_changed = False
+
+    retired_files = []
+    for fname in RETIRED_HOOKS:
+        dest = HOOKS_DIR / fname
+        if dest.exists():
+            print(f"  [remove] {fname} — retired")
+            retired_files.append(dest)
+            changed = True
+        for event, event_list in list(hooks_cfg.items()):
+            if not isinstance(event_list, list):
+                continue
+            kept = _without_hook(event_list, fname)
+            if kept != event_list:
+                print(f"  [remove] settings.json {event} hook → {fname}")
+                if not dry_run:
+                    if kept:
+                        hooks_cfg[event] = kept
+                    else:
+                        del hooks_cfg[event]
+                settings_changed = True
+                changed = True
 
     for event, spec in HOOK_BLOCKS.items():
         event_list = hooks_cfg.setdefault(event, [])
+        if not isinstance(event_list, list):
+            raise InstallError(f"settings.json hooks.{event} is not a list")
         if _already_in_hooks(event_list, spec["check_substr"]):
             print(f"  [skip] settings.json {event} hook — already wired")
             continue
@@ -155,6 +214,12 @@ def install(dry_run: bool = False) -> bool:
         print(f"  [backup] settings.json → {backup.name}")
         SETTINGS_PATH.write_text(json.dumps(cfg, indent=2))
         print("  [wrote] ~/.claude/settings.json")
+
+    # Delete retired scripts only after settings.json no longer points at them,
+    # so a failed write never leaves a registration to a missing file.
+    if not dry_run:
+        for dest in retired_files:
+            dest.unlink()
 
     return changed
 
@@ -188,7 +253,7 @@ def main() -> None:
         print("\n[dry-run complete] Re-run without --dry-run to apply.")
     else:
         print("\nInstall complete. Restart Claude Code for hooks to take effect.")
-        print("What changes when you idle >5 minutes:")
+        print("What changes when you idle past the 1-hour cache TTL:")
         print("  1. Your next prompt will be blocked once with a cost warning.")
         print("  2. Press ↑ to resend as-is (accepts the cache rebuild cost).")
         print("  3. Or run /compact to compress context, then resend.")
